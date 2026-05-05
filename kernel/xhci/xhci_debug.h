@@ -1,7 +1,7 @@
 #ifndef XHCI_DEBUG_H
 #define XHCI_DEBUG_H
 #include "xhci.h"
-#include "../../include/serial.h"
+#include "../include/serial.h"
 
 /* ═══════════════════════════════════════════════════════════════════════
    xhci_debug.h — diagnostic helpers
