@@ -1,5 +1,5 @@
 #include "radeon.h"
-#include "../pci.h"
+#include "../../pci.h"
 #include "../framebuffer.h"
 
 
