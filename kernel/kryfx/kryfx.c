@@ -1,7 +1,7 @@
 /*
  * vixfs.c — VixFS read-only in-memory filesystem (Viuxne OS) used in (YtarOS)
  */
-#include "kryfs.h"
+#include "kryfx.h"
 #include <stdint.h>
 
 static const vixfs_header_t *g_hdr   = 0;
