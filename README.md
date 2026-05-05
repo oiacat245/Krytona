@@ -1,2 +1,2 @@
-# Krytona
-this is a discord 3.0
+# KyarOS
+An os based in my friend os!
