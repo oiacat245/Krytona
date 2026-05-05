@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 #include "../../include/stddef.h"
-#include "../pci.h"
+#include "../../pci.h"
 #include "../framebuffer.h"
 
 #define PCI_VENDOR_ATI              0x1002
