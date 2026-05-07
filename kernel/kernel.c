@@ -1,5 +1,5 @@
 /**
- * kernel.c - Kernel principal do KryFX OS
+ * kernel.c - Kernel principal do Ytar OS
  *
  * Ponto de entrada chamado pelo boot.asm após configurar a stack.
  * Inicializa todos os subsistemas na ordem correta:
