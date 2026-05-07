@@ -1,423 +1,750 @@
 /**
- * ehci.h - Driver EHCI (Enhanced Host Controller Interface) para SO próprio
- * Compatível com USB 2.0 (High Speed 480 Mbps)
+ * ehci.c - Implementação do driver EHCI USB 2.0 para SO próprio
  *
  * Referências:
  *  - EHCI Specification 1.0 (Intel)
- *  - Linux ehci-hcd driver (drivers/usb/host/ehci*)
+ *  - Linux ehci-hcd (drivers/usb/host/ehci-hcd.c)
  *  - OSDev Wiki: USB EHCI
  */
 
-#ifndef EHCI_H
-#define EHCI_H
-
-#include <stdint.h>
-#include <stddef.h>
+#include "ehci.h"
 
 /* ============================================================
- * Tipos básicos
+ * Stubs do kernel — substitua pelas suas implementações
  * ============================================================ */
-typedef uint8_t  u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
-typedef int32_t  i32;
+
+static inline u32 pci_read32(u8 bus, u8 slot, u8 func, u8 offset) {
+    u32 addr = (1u << 31) |
+               ((u32)bus  << 16) |
+               ((u32)slot << 11) |
+               ((u32)func <<  8) |
+               (offset & 0xFC);
+    (void)addr;
+    /* outl(addr, 0xCF8); return inl(0xCFC); */
+    return 0;
+}
+static inline void pci_write32(u8 bus, u8 slot, u8 func, u8 offset, u32 val) {
+    u32 addr = (1u << 31) |
+               ((u32)bus  << 16) |
+               ((u32)slot << 11) |
+               ((u32)func <<  8) |
+               (offset & 0xFC);
+    (void)addr; (void)val;
+}
+
+static inline void *dma_alloc(u64 size, u64 align, u64 *phys_out) {
+    (void)size; (void)align;
+    *phys_out = 0;
+    return (void *)0; /* substituir: pmm_alloc_aligned(size, align) */
+}
+static inline void *phys_to_virt(u64 p) { return (void *)(uintptr_t)p; }
+static inline u64   virt_to_phys(const void *v) { return (u64)(uintptr_t)v; }
+
+static inline void udelay(u32 us) {
+    volatile u32 i;
+    for (i = 0; i < us * 1000; i++) __asm__ volatile("nop");
+}
+static inline void mdelay(u32 ms) { udelay(ms * 1000); }
+
+static void *ehci_memset(void *d, int v, size_t n) {
+    u8 *p = (u8 *)d; while (n--) *p++ = (u8)v; return d;
+}
+static void *ehci_memcpy(void *d, const void *s, size_t n) {
+    u8 *dp=(u8*)d; const u8 *sp=(const u8*)s; while(n--) *dp++=*sp++; return d;
+}
 
 /* ============================================================
- * PCI Class Code EHCI
+ * PCI helpers
  * ============================================================ */
-#define PCI_CLASS_EHCI              0x0C0320  /* Class 0x0C / Sub 0x03 / ProgIF 0x20 */
+#define PCI_VENDOR_ID   0x00
+#define PCI_COMMAND     0x04
+#define PCI_CLASS_REV   0x08
+#define PCI_BAR0        0x10
+#define PCI_CMD_MEMORY  (1<<1)
+#define PCI_CMD_MASTER  (1<<2)
 
 /* ============================================================
- * Registradores de Capability (offset fixo em BAR0)
- * São read-only e descrevem as capacidades do HC
+ * Leitura / escrita operacional
  * ============================================================ */
-#define EHCI_CAP_CAPLENGTH          0x00  /* u8  — tamanho da região capability */
-#define EHCI_CAP_HCIVERSION         0x02  /* u16 — versão BCD da interface (0x0100) */
-#define EHCI_CAP_HCSPARAMS          0x04  /* u32 — Structural Parameters */
-#define EHCI_CAP_HCCPARAMS          0x08  /* u32 — Capability Parameters */
-#define EHCI_CAP_HCSP_PORTROUTE     0x0C  /* u64 — companion port routing */
 
-/* Bits de HCSPARAMS */
-#define EHCI_HCS_N_PORTS(x)        ((x) & 0xF)         /* Número de portas */
-#define EHCI_HCS_PPC                (1 << 4)            /* Port Power Control */
-#define EHCI_HCS_PRR                (1 << 7)            /* Port Routing Rules */
-#define EHCI_HCS_N_PCC(x)          (((x) >> 8) & 0xF)  /* Portas por companion */
-#define EHCI_HCS_N_CC(x)           (((x) >> 12) & 0xF) /* Número de companions */
-#define EHCI_HCS_P_INDICATOR        (1 << 16)           /* Port Indicators */
+u32 ehci_read32(const ehci_t *ctrl, u32 reg) {
+    return *((volatile u32 *)(ctrl->op_base + reg));
+}
+void ehci_write32(ehci_t *ctrl, u32 reg, u32 val) {
+    *((volatile u32 *)(ctrl->op_base + reg)) = val;
+    __asm__ volatile("" ::: "memory");
+}
 
-/* Bits de HCCPARAMS */
-#define EHCI_HCC_64BIT              (1 << 0)  /* 64-bit addressing */
-#define EHCI_HCC_PFLF               (1 << 1)  /* Programmable Frame List Flag */
-#define EHCI_HCC_ASPC               (1 << 2)  /* Async Schedule Park Capability */
-#define EHCI_HCC_IST(x)             (((x) >> 4) & 0xF)  /* Isochronous Scheduling Threshold */
-#define EHCI_HCC_EECP(x)            (((x) >> 8) & 0xFF) /* Extended Capabilities Pointer */
+static u32 ehci_cap_read32(const ehci_t *ctrl, u32 reg) {
+    return *((volatile u32 *)(ctrl->cap_base + reg));
+}
+static u16 ehci_cap_read16(const ehci_t *ctrl, u32 reg) {
+    return *((volatile u16 *)(ctrl->cap_base + reg));
+}
+static u8 ehci_cap_read8(const ehci_t *ctrl, u32 reg) {
+    return *((volatile u8 *)(ctrl->cap_base + reg));
+}
+
+static int ehci_wait_reg(ehci_t *ctrl, u32 reg,
+                         u32 mask, u32 expected, u32 timeout_ms)
+{
+    u32 i;
+    for (i = 0; i < timeout_ms; i++) {
+        if ((ehci_read32(ctrl, reg) & mask) == expected) return 0;
+        mdelay(1);
+    }
+    return -1;
+}
 
 /* ============================================================
- * Registradores Operacionais
- * Base = BAR0 + CAPLENGTH (lido em runtime)
+ * Pool de qTD / QH
  * ============================================================ */
-#define EHCI_OP_USBCMD              0x00  /* USB Command */
-#define EHCI_OP_USBSTS              0x04  /* USB Status */
-#define EHCI_OP_USBINTR             0x08  /* USB Interrupt Enable */
-#define EHCI_OP_FRINDEX             0x0C  /* Frame Index (microframe counter) */
-#define EHCI_OP_CTRLDSSEGMENT       0x10  /* Control Data Structure Segment (64-bit) */
-#define EHCI_OP_PERIODICLISTBASE    0x14  /* Periodic Frame List Base Address */
-#define EHCI_OP_ASYNCLISTADDR       0x18  /* Async List Address (ponteiro para QH head) */
-#define EHCI_OP_CONFIGFLAG          0x40  /* Configure Flag */
-#define EHCI_OP_PORTSC(n)           (0x44 + (n) * 4)  /* Port Status/Control porta n */
+
+static ehci_qtd_t *qtd_alloc(ehci_t *ctrl, u64 *phys_out) {
+    u32 i;
+    for (i = 0; i < EHCI_QTD_POOL_SIZE; i++) {
+        if (!ctrl->qtd_used[i]) {
+            ctrl->qtd_used[i] = 1;
+            ehci_qtd_t *q = &ctrl->qtd_pool[i];
+            ehci_memset(q, 0, sizeof(ehci_qtd_t));
+            q->next     = QTD_NEXT_TERMINATE;
+            q->alt_next = QTD_NEXT_TERMINATE;
+            *phys_out = ctrl->qtd_pool_phys + i * sizeof(ehci_qtd_t);
+            return q;
+        }
+    }
+    return (void *)0;
+}
+static void qtd_free(ehci_t *ctrl, ehci_qtd_t *q) {
+    u32 idx = (u32)(q - ctrl->qtd_pool);
+    if (idx < EHCI_QTD_POOL_SIZE) ctrl->qtd_used[idx] = 0;
+}
+
+static ehci_qh_t *qh_alloc(ehci_t *ctrl, u64 *phys_out) {
+    u32 i;
+    for (i = 0; i < EHCI_QH_POOL_SIZE; i++) {
+        if (!ctrl->qh_used[i]) {
+            ctrl->qh_used[i] = 1;
+            ehci_qh_t *q = &ctrl->qh_pool[i];
+            ehci_memset(q, 0, sizeof(ehci_qh_t));
+            *phys_out = ctrl->qh_pool_phys + i * sizeof(ehci_qh_t);
+            return q;
+        }
+    }
+    return (void *)0;
+}
+static void qh_free(ehci_t *ctrl, ehci_qh_t *q) {
+    u32 idx = (u32)(q - ctrl->qh_pool);
+    if (idx < EHCI_QH_POOL_SIZE) ctrl->qh_used[idx] = 0;
+}
 
 /* ============================================================
- * Bits dos registradores operacionais
+ * Detecção PCI
  * ============================================================ */
 
-/* EHCI_OP_USBCMD */
-#define EHCI_CMD_RUN                (1 << 0)   /* Run/Stop */
-#define EHCI_CMD_HCRESET            (1 << 1)   /* Host Controller Reset */
-#define EHCI_CMD_FLS_MASK           (3 << 2)   /* Frame List Size */
-#define EHCI_CMD_FLS_1024           (0 << 2)   /* 1024 entries */
-#define EHCI_CMD_FLS_512            (1 << 2)   /* 512 entries */
-#define EHCI_CMD_FLS_256            (2 << 2)   /* 256 entries */
-#define EHCI_CMD_PSE                (1 << 4)   /* Periodic Schedule Enable */
-#define EHCI_CMD_ASE                (1 << 5)   /* Async Schedule Enable */
-#define EHCI_CMD_IAAD               (1 << 6)   /* Interrupt on Async Advance Doorbell */
-#define EHCI_CMD_LHCR               (1 << 7)   /* Light Host Controller Reset */
-#define EHCI_CMD_ASPMC(x)           ((x) << 8) /* Async Schedule Park Mode Count */
-#define EHCI_CMD_ASPME              (1 << 11)  /* Async Schedule Park Mode Enable */
-#define EHCI_CMD_ITC_MASK           (0xFF << 16) /* Interrupt Threshold Control */
-#define EHCI_CMD_ITC_1MF            (0x01 << 16) /* 1 microframe */
-#define EHCI_CMD_ITC_8MF            (0x08 << 16) /* 8 microframes = 1ms */
-
-/* EHCI_OP_USBSTS */
-#define EHCI_STS_INT                (1 << 0)   /* USB Interrupt */
-#define EHCI_STS_ERR                (1 << 1)   /* USB Error Interrupt */
-#define EHCI_STS_PCD                (1 << 2)   /* Port Change Detect */
-#define EHCI_STS_FLR                (1 << 3)   /* Frame List Rollover */
-#define EHCI_STS_HSE                (1 << 4)   /* Host System Error */
-#define EHCI_STS_IAA                (1 << 5)   /* Interrupt on Async Advance */
-#define EHCI_STS_HALTED             (1 << 12)  /* HC Halted */
-#define EHCI_STS_RECLAMATION        (1 << 13)  /* Reclamation */
-#define EHCI_STS_PSS                (1 << 14)  /* Periodic Schedule Status */
-#define EHCI_STS_ASS                (1 << 15)  /* Async Schedule Status */
-
-/* EHCI_OP_USBINTR */
-#define EHCI_INTR_INT               (1 << 0)
-#define EHCI_INTR_ERR               (1 << 1)
-#define EHCI_INTR_PCD               (1 << 2)
-#define EHCI_INTR_FLR               (1 << 3)
-#define EHCI_INTR_HSE               (1 << 4)
-#define EHCI_INTR_IAA               (1 << 5)
-
-/* EHCI_OP_CONFIGFLAG */
-#define EHCI_CF_FLAG                (1 << 0)   /* Configure Flag — roteia portas para EHCI */
-
-/* EHCI_OP_PORTSC */
-#define EHCI_PORT_CCS               (1 << 0)   /* Current Connect Status */
-#define EHCI_PORT_CSC               (1 << 1)   /* Connect Status Change */
-#define EHCI_PORT_PE                (1 << 2)   /* Port Enable */
-#define EHCI_PORT_PEC               (1 << 3)   /* Port Enable/Disable Change */
-#define EHCI_PORT_OCA               (1 << 4)   /* Over-current Active */
-#define EHCI_PORT_OCC               (1 << 5)   /* Over-current Change */
-#define EHCI_PORT_FPR               (1 << 6)   /* Force Port Resume */
-#define EHCI_PORT_SUSPEND           (1 << 7)   /* Suspend */
-#define EHCI_PORT_RESET             (1 << 8)   /* Port Reset */
-#define EHCI_PORT_LS_MASK           (3 << 10)  /* Line Status */
-#define EHCI_PORT_LS_SE0            (0 << 10)  /* SE0 (nada conectado ou reset) */
-#define EHCI_PORT_LS_K              (1 << 10)  /* K-state (Low Speed) */
-#define EHCI_PORT_LS_J              (2 << 10)  /* J-state */
-#define EHCI_PORT_PP                (1 << 12)  /* Port Power */
-#define EHCI_PORT_OWNER             (1 << 13)  /* Port Owner (0=EHCI, 1=companion) */
-#define EHCI_PORT_IC_MASK           (3 << 14)  /* Port Indicator Control */
-#define EHCI_PORT_TEST_MASK         (0xF << 16)/* Port Test Control */
-#define EHCI_PORT_WCE               (1 << 20)  /* Wake on Connect Enable */
-#define EHCI_PORT_WDE               (1 << 21)  /* Wake on Disconnect Enable */
-#define EHCI_PORT_WKOC_E            (1 << 22)  /* Wake on Over-current Enable */
-
-/* Bits de escrita no PORTSC (write-1-to-clear) */
-#define EHCI_PORT_CHANGE_BITS       (EHCI_PORT_CSC | EHCI_PORT_PEC | EHCI_PORT_OCC)
+int ehci_detect(ehci_t *ctrl) {
+    u8 bus, slot, func;
+    for (bus=0; bus<8; bus++) {
+        for (slot=0; slot<32; slot++) {
+            for (func=0; func<8; func++) {
+                u32 id = pci_read32(bus, slot, func, PCI_VENDOR_ID);
+                if ((id & 0xFFFF) == 0xFFFF) continue;
+                u32 cls = pci_read32(bus, slot, func, PCI_CLASS_REV);
+                u8 base    = (u8)(cls >> 24);
+                u8 sub     = (u8)((cls >> 16) & 0xFF);
+                u8 prog_if = (u8)((cls >>  8) & 0xFF);
+                if (base == 0x0C && sub == 0x03 && prog_if == 0x20) {
+                    ctrl->vendor_id = (u16)(id & 0xFFFF);
+                    ctrl->device_id = (u16)(id >> 16);
+                    ctrl->pci_bus   = bus;
+                    ctrl->pci_slot  = slot;
+                    ctrl->pci_func  = func;
+                    return 0;
+                }
+            }
+        }
+    }
+    return -1;
+}
 
 /* ============================================================
- * Extended Capability — BIOS/OS Handoff (USBLEGSUP)
- * Acessado via PCI config space no offset EECP
+ * BIOS Handoff — toma posse do HC via USBLEGSUP
  * ============================================================ */
-#define EHCI_USBLEGSUP_ID           0x01      /* Cap ID = 1 */
-#define EHCI_USBLEGSUP_BIOS_SEM     (1 << 16) /* BIOS owned semaphore */
-#define EHCI_USBLEGSUP_OS_SEM       (1 << 24) /* OS owned semaphore */
+
+static void ehci_bios_handoff(ehci_t *ctrl) {
+    if (!ctrl->eecp) return;
+
+    u32 legsup = pci_read32(ctrl->pci_bus, ctrl->pci_slot,
+                             ctrl->pci_func, ctrl->eecp);
+
+    /* Verifica se é realmente USBLEGSUP (cap ID = 1) */
+    if ((legsup & 0xFF) != EHCI_USBLEGSUP_ID) return;
+
+    if (legsup & EHCI_USBLEGSUP_BIOS_SEM) {
+        /* Pede posse: seta OS semaphore */
+        pci_write32(ctrl->pci_bus, ctrl->pci_slot, ctrl->pci_func,
+                    ctrl->eecp, legsup | EHCI_USBLEGSUP_OS_SEM);
+
+        /* Aguarda BIOS liberar (até 1s) */
+        u32 timeout = 1000;
+        while (timeout--) {
+            legsup = pci_read32(ctrl->pci_bus, ctrl->pci_slot,
+                                ctrl->pci_func, ctrl->eecp);
+            if (!(legsup & EHCI_USBLEGSUP_BIOS_SEM)) break;
+            mdelay(1);
+        }
+        /* Força: desabilita SMI legado no USBLEGCTLSTS */
+        u32 ctlsts = pci_read32(ctrl->pci_bus, ctrl->pci_slot,
+                                ctrl->pci_func, ctrl->eecp + 4);
+        ctlsts &= ~0x1F;   /* Desabilita todos os SMI enables */
+        ctlsts |=  0x1F << 16; /* Limpa status bits */
+        pci_write32(ctrl->pci_bus, ctrl->pci_slot, ctrl->pci_func,
+                    ctrl->eecp + 4, ctlsts);
+    }
+}
 
 /* ============================================================
- * Estruturas DMA
- * ATENÇÃO: Devem estar em memória física contígua e alinhadas!
+ * Inicialização
  * ============================================================ */
 
-/**
- * Queue Element Transfer Descriptor (qTD)
- * Tamanho: 32 bytes, alinhamento: 32 bytes
- */
-typedef struct __attribute__((packed, aligned(32))) ehci_qtd {
-    u32 next;           /* Ponteiro físico para próximo qTD (bit0 = Terminate) */
-    u32 alt_next;       /* Alternate next qTD (usado para short packet) */
-    u32 token;          /* Status, PID, toggle, tamanho */
-    u32 buf[5];         /* Buffer Page Pointers (4KB cada) */
-    /* Extensão 64 bits (high 32 bits de cada buf) */
-    u32 buf_hi[5];
-} ehci_qtd_t;
+int ehci_init(ehci_t *ctrl, u8 bus, u8 slot, u8 func) {
+    ehci_memset(ctrl, 0, sizeof(ehci_t));
+    ctrl->pci_bus = bus; ctrl->pci_slot = slot; ctrl->pci_func = func;
 
-/* Bits do campo next / alt_next do qTD */
-#define QTD_NEXT_TERMINATE          (1 << 0)  /* Lista termina aqui */
+    u32 id = pci_read32(bus, slot, func, PCI_VENDOR_ID);
+    ctrl->vendor_id = (u16)(id & 0xFFFF);
+    ctrl->device_id = (u16)(id >> 16);
 
-/* Bits do campo token do qTD */
-#define QTD_STATUS_MASK             0xFF
-#define QTD_STATUS_ACTIVE           (1 << 7)  /* HC deve processar */
-#define QTD_STATUS_HALTED           (1 << 6)  /* Endpoint parado */
-#define QTD_STATUS_BUFERR           (1 << 5)  /* Data Buffer Error */
-#define QTD_STATUS_BABBLE           (1 << 4)  /* Babble Detected */
-#define QTD_STATUS_XACTERR          (1 << 3)  /* Transaction Error */
-#define QTD_STATUS_MISSED_MF        (1 << 2)  /* Missed Micro-Frame */
-#define QTD_STATUS_SPLIT_XSTATE     (1 << 1)  /* Split Transaction State */
-#define QTD_STATUS_PING             (1 << 0)  /* Ping State */
-#define QTD_PID_OUT                 (0 << 8)
-#define QTD_PID_IN                  (1 << 8)
-#define QTD_PID_SETUP               (2 << 8)
-#define QTD_CERR(n)                 ((n) << 10)  /* Error Counter (2 bits) */
-#define QTD_CERR_3                  QTD_CERR(3)
-#define QTD_C_PAGE(n)               ((n) << 12)  /* Current Page */
-#define QTD_IOC                     (1 << 15)    /* Interrupt on Complete */
-#define QTD_BYTES(n)                ((n) << 16)  /* Total Bytes to Transfer */
-#define QTD_BYTES_MASK              (0x7FFF << 16)
-#define QTD_TOGGLE                  (1u << 31)   /* Data Toggle */
-#define QTD_TOGGLE_0                (0u << 31)
-#define QTD_TOGGLE_1                (1u << 31)
+    /* Habilita PCI */
+    u32 cmd = pci_read32(bus, slot, func, PCI_COMMAND);
+    cmd |= PCI_CMD_MEMORY | PCI_CMD_MASTER;
+    pci_write32(bus, slot, func, PCI_COMMAND, cmd);
 
-/**
- * Queue Head (QH)
- * Tamanho: 48 bytes, alinhamento: 32 bytes
- */
-typedef struct __attribute__((packed, aligned(32))) ehci_qh {
-    /* Word 0 — Queue Head Horizontal Link Pointer */
-    u32 next;       /* Ponteiro físico para próximo QH/ITD (bits 1:0 = type) */
+    /* BAR0 = Capability + Operational registers */
+    u32 bar0 = pci_read32(bus, slot, func, PCI_BAR0);
+    u64 mmio_phys = (u64)(bar0 & ~0xFu);
+    ctrl->mmio_size = 4096;
+    ctrl->cap_base  = (volatile u8 *)phys_to_virt(mmio_phys);
 
-    /* Word 1 — Endpoint Characteristics */
-    u32 epchar;
+    /* Lê capability registers */
+    ctrl->cap_length  = ehci_cap_read8 (ctrl, EHCI_CAP_CAPLENGTH);
+    ctrl->hci_version = ehci_cap_read16(ctrl, EHCI_CAP_HCIVERSION);
+    ctrl->hcs_params  = ehci_cap_read32(ctrl, EHCI_CAP_HCSPARAMS);
+    ctrl->hcc_params  = ehci_cap_read32(ctrl, EHCI_CAP_HCCPARAMS);
 
-    /* Word 2 — Endpoint Capabilities */
-    u32 epcap;
+    /* Operational base = cap_base + cap_length */
+    ctrl->op_base   = ctrl->cap_base + ctrl->cap_length;
+    ctrl->has_64bit = (ctrl->hcc_params & EHCI_HCC_64BIT) ? 1 : 0;
+    ctrl->eecp      = (u8)EHCI_HCC_EECP(ctrl->hcc_params);
+    ctrl->num_ports = (u8)EHCI_HCS_N_PORTS(ctrl->hcs_params);
+    if (ctrl->num_ports > EHCI_MAX_PORTS)
+        ctrl->num_ports = EHCI_MAX_PORTS;
 
-    /* Word 3 — Current qTD Pointer */
-    u32 current_qtd;
+    /* Toma posse do BIOS */
+    ehci_bios_handoff(ctrl);
 
-    /* Transfer Overlay — estado interno do HC (espelha o qTD atual) */
-    u32 qtd_next;
-    u32 qtd_alt_next;
-    u32 qtd_token;
-    u32 qtd_buf[5];
-    u32 qtd_buf_hi[5];
-} ehci_qh_t;
+    /* ---- Reset do HC ---- */
+    /* Para o HC antes de resetar */
+    u32 usbcmd = ehci_read32(ctrl, EHCI_OP_USBCMD);
+    usbcmd &= ~EHCI_CMD_RUN;
+    ehci_write32(ctrl, EHCI_OP_USBCMD, usbcmd);
+    ehci_wait_reg(ctrl, EHCI_OP_USBSTS, EHCI_STS_HALTED, EHCI_STS_HALTED, 100);
 
-/* Bits do campo next do QH (horizontal link) */
-#define QH_NEXT_TERMINATE           (1 << 0)
-#define QH_TYPE_ITD                 (0 << 1)   /* Isochronous TD */
-#define QH_TYPE_QH                  (1 << 1)   /* Queue Head */
-#define QH_TYPE_SITD                (2 << 1)   /* Split-transaction Isochronous TD */
-#define QH_TYPE_FSTN                (3 << 1)   /* Frame Span Traversal Node */
+    /* Reseta */
+    ehci_write32(ctrl, EHCI_OP_USBCMD, EHCI_CMD_HCRESET);
+    if (ehci_wait_reg(ctrl, EHCI_OP_USBCMD, EHCI_CMD_HCRESET, 0, 100) != 0)
+        return -1;
 
-/* Bits de epchar (Endpoint Characteristics) */
-#define QH_DEVADDR(n)               ((n) & 0x7F)
-#define QH_INACTIVE                 (1 << 7)   /* Inativo no próximo microframe */
-#define QH_ENDPT(n)                 (((n) & 0xF) << 8)
-#define QH_EPS_FULL                 (0 << 12)  /* Full Speed */
-#define QH_EPS_LOW                  (1 << 12)  /* Low Speed */
-#define QH_EPS_HIGH                 (2 << 12)  /* High Speed */
-#define QH_DTC                      (1 << 14)  /* Data Toggle Control (1=usa toggle do qTD) */
-#define QH_H                        (1 << 15)  /* Head of Reclamation List */
-#define QH_MAXPKT(n)                (((n) & 0x7FF) << 16)
-#define QH_C                        (1 << 27)  /* Control Endpoint (Low/Full apenas) */
-#define QH_RL(n)                    (((n) & 0xF) << 28) /* Nak Count Reload */
+    /* ---- Configura 64-bit segment (sempre 0 para < 4GB) ---- */
+    if (ctrl->has_64bit)
+        ehci_write32(ctrl, EHCI_OP_CTRLDSSEGMENT, 0);
 
-/* Bits de epcap (Endpoint Capabilities) */
-#define QH_SMASK(n)                 ((n) & 0xFF)         /* Interrupt Schedule Mask */
-#define QH_CMASK(n)                 (((n) & 0xFF) << 8)  /* Split Completion Mask */
-#define QH_HUBADDR(n)               (((n) & 0x7F) << 16) /* Hub Address (TT) */
-#define QH_PORTNUM(n)               (((n) & 0x7F) << 23) /* Port Number (TT) */
-#define QH_MULT(n)                  (((n) & 0x3) << 30)  /* High-BW Pipe Multiplier */
+    /* ---- Aloca Periodic Frame List (1024 entradas × 4 bytes = 4KB) ---- */
+    ctrl->frame_list = (ehci_frame_list_t *)dma_alloc(
+        sizeof(ehci_frame_list_t), 4096, &ctrl->frame_list_phys);
+    if (!ctrl->frame_list) return -2;
 
-/**
- * Isochronous Transfer Descriptor (iTD) — USB 2.0 High Speed
- * Tamanho: 64 bytes, alinhamento: 32 bytes
- */
-typedef struct __attribute__((packed, aligned(32))) ehci_itd {
-    u32 next;
-    u32 transaction[8]; /* Um por microframe */
-    u32 buf[7];
-    u32 buf_hi[7];
-} ehci_itd_t;
+    /* Preenche frame list com terminators */
+    u32 i;
+    for (i = 0; i < EHCI_FRAME_LIST_SIZE; i++)
+        (*ctrl->frame_list)[i] = QTD_NEXT_TERMINATE;
 
-/**
- * Periodic Frame List — array de 1024 ponteiros físicos
- * Alinhamento: 4096 bytes (página)
- */
-#define EHCI_FRAME_LIST_SIZE        1024
-typedef u32 ehci_frame_list_t[EHCI_FRAME_LIST_SIZE];
+    /* ---- Aloca Async List head QH (dummy circular) ---- */
+    ctrl->async_head = qh_alloc(ctrl, &ctrl->async_head_phys);
+    /* qh_alloc ainda não está disponível — aloca diretamente */
+    ctrl->qh_pool = (ehci_qh_t *)dma_alloc(
+        sizeof(ehci_qh_t) * EHCI_QH_POOL_SIZE, 32, &ctrl->qh_pool_phys);
+    if (!ctrl->qh_pool) return -3;
+    ehci_memset(ctrl->qh_pool, 0, sizeof(ehci_qh_t) * EHCI_QH_POOL_SIZE);
+
+    ctrl->async_head = &ctrl->qh_pool[0];
+    ctrl->qh_used[0] = 1;
+    ctrl->async_head_phys = ctrl->qh_pool_phys;
+
+    /* Dummy QH aponta para si mesmo — lista circular vazia */
+    ctrl->async_head->next   = (u32)ctrl->async_head_phys | QH_TYPE_QH;
+    ctrl->async_head->epchar = QH_H | QH_MAXPKT(64) | QH_EPS_HIGH | QH_DTC;
+    ctrl->async_head->epcap  = QH_MULT(1);
+    ctrl->async_head->qtd_next     = QTD_NEXT_TERMINATE;
+    ctrl->async_head->qtd_alt_next = QTD_NEXT_TERMINATE;
+    ctrl->async_head->qtd_token    = 0;
+
+    /* ---- Aloca pool de qTDs ---- */
+    ctrl->qtd_pool = (ehci_qtd_t *)dma_alloc(
+        sizeof(ehci_qtd_t) * EHCI_QTD_POOL_SIZE, 32, &ctrl->qtd_pool_phys);
+    if (!ctrl->qtd_pool) return -4;
+    ehci_memset(ctrl->qtd_pool, 0, sizeof(ehci_qtd_t) * EHCI_QTD_POOL_SIZE);
+
+    /* ---- Configura registradores do HC ---- */
+    ehci_write32(ctrl, EHCI_OP_PERIODICLISTBASE, (u32)ctrl->frame_list_phys);
+    ehci_write32(ctrl, EHCI_OP_ASYNCLISTADDR,    (u32)ctrl->async_head_phys);
+
+    /* Limpa status pendentes */
+    ehci_write32(ctrl, EHCI_OP_USBSTS, 0x3F);
+
+    /* Habilita interrupções */
+    ehci_write32(ctrl, EHCI_OP_USBINTR,
+                 EHCI_INTR_INT | EHCI_INTR_ERR |
+                 EHCI_INTR_PCD | EHCI_INTR_HSE);
+
+    /* Inicia o HC */
+    usbcmd = EHCI_CMD_RUN         |
+             EHCI_CMD_FLS_1024    |  /* Frame list de 1024 */
+             EHCI_CMD_ITC_8MF     |  /* 1 interrupção por ms */
+             EHCI_CMD_ASE;           /* Async schedule enable */
+    ehci_write32(ctrl, EHCI_OP_USBCMD, usbcmd);
+    ehci_wait_reg(ctrl, EHCI_OP_USBSTS, EHCI_STS_HALTED, 0, 100);
+
+    /* ---- Configure Flag — roteia todas as portas para o EHCI ---- */
+    ehci_write32(ctrl, EHCI_OP_CONFIGFLAG, EHCI_CF_FLAG);
+    udelay(5);
+
+    /* Liga power em todas as portas */
+    for (i = 0; i < ctrl->num_ports; i++) {
+        u32 ps = ehci_read32(ctrl, EHCI_OP_PORTSC(i));
+        if (!(ps & EHCI_PORT_PP))
+            ehci_write32(ctrl, EHCI_OP_PORTSC(i), ps | EHCI_PORT_PP);
+    }
+    mdelay(20); /* PowerOn-to-PowerGood */
+
+    ctrl->initialized = 1;
+    return 0;
+}
 
 /* ============================================================
- * Estruturas internas do driver
+ * Gerenciamento de portas
  * ============================================================ */
 
-#define EHCI_MAX_PORTS      15
-#define EHCI_QTD_POOL_SIZE  64
-#define EHCI_QH_POOL_SIZE   32
+int ehci_port_reset(ehci_t *ctrl, u8 port) {
+    if (port >= ctrl->num_ports) return -1;
 
-typedef enum {
-    EHCI_PIPE_CONTROL     = 0,
-    EHCI_PIPE_BULK        = 1,
-    EHCI_PIPE_INTERRUPT   = 2,
-    EHCI_PIPE_ISOCHRONOUS = 3,
-} ehci_pipe_type_t;
+    u32 ps = ehci_read32(ctrl, EHCI_OP_PORTSC(port));
 
-typedef struct {
-    ehci_pipe_type_t type;
-    u8   dev_addr;
-    u8   ep_num;
-    u8   speed;        /* 0=Full, 1=Low, 2=High */
-    u16  max_packet;
-    u8   toggle;       /* Data toggle atual */
-    u8   hub_addr;     /* Para TT (Transaction Translator) */
-    u8   hub_port;     /* Porta no hub TT */
-} ehci_pipe_t;
+    /* Limpa enable antes de resetar */
+    ps &= ~(EHCI_PORT_PE | EHCI_PORT_CHANGE_BITS);
+    ps |= EHCI_PORT_RESET;
+    ehci_write32(ctrl, EHCI_OP_PORTSC(port), ps);
+    mdelay(50); /* USB spec: >= 10ms */
 
-typedef struct {
-    /* PCI */
-    u8   pci_bus;
-    u8   pci_slot;
-    u8   pci_func;
-    u16  vendor_id;
-    u16  device_id;
+    /* Desativa reset */
+    ps = ehci_read32(ctrl, EHCI_OP_PORTSC(port));
+    ps &= ~EHCI_PORT_RESET;
+    ehci_write32(ctrl, EHCI_OP_PORTSC(port), ps);
 
-    /* Capability registers (BAR0) */
-    volatile u8 *cap_base;
-    u8           cap_length;    /* Offset para operational regs */
-    u16          hci_version;
-    u32          hcs_params;
-    u32          hcc_params;
+    /* Aguarda reset completar */
+    if (ehci_wait_reg(ctrl, EHCI_OP_PORTSC(port),
+                      EHCI_PORT_RESET, 0, 100) != 0)
+        return -1;
 
-    /* Operational registers (BAR0 + cap_length) */
-    volatile u8 *op_base;
-    u64          mmio_size;
+    mdelay(10); /* recovery */
+    return 0;
+}
 
-    /* Periodic Frame List */
-    ehci_frame_list_t *frame_list;
-    u64                frame_list_phys;
+int ehci_scan_ports(ehci_t *ctrl) {
+    int found = 0;
+    u8 i;
 
-    /* Async list head QH (dummy head da lista circular) */
-    ehci_qh_t *async_head;
-    u64        async_head_phys;
+    for (i = 0; i < ctrl->num_ports; i++) {
+        u32 ps = ehci_read32(ctrl, EHCI_OP_PORTSC(i));
 
-    /* Pools DMA */
-    ehci_qtd_t *qtd_pool;
-    u64         qtd_pool_phys;
-    u8          qtd_used[EHCI_QTD_POOL_SIZE];
+        /* Limpa change bits */
+        if (ps & EHCI_PORT_CHANGE_BITS)
+            ehci_write32(ctrl, EHCI_OP_PORTSC(i),
+                         (ps & ~EHCI_PORT_CHANGE_BITS) | EHCI_PORT_CHANGE_BITS);
 
-    ehci_qh_t  *qh_pool;
-    u64         qh_pool_phys;
-    u8          qh_used[EHCI_QH_POOL_SIZE];
+        if (!(ps & EHCI_PORT_CCS)) {
+            ctrl->port_connected[i] = 0;
+            continue;
+        }
 
-    /* Root Hub */
-    u8   num_ports;
-    u8   port_connected[EHCI_MAX_PORTS];
-    u8   port_speed[EHCI_MAX_PORTS];  /* 0=Full,1=Low,2=High */
+        /* Verifica line status — K = Low Speed device */
+        u32 ls = ps & EHCI_PORT_LS_MASK;
+        if (ls == EHCI_PORT_LS_K) {
+            /* Low Speed: transfere para companion OHCI/UHCI */
+            ctrl->port_speed[i] = 1; /* Low */
+            ps = ehci_read32(ctrl, EHCI_OP_PORTSC(i));
+            ps |= EHCI_PORT_OWNER; /* Entrega ao companion */
+            ehci_write32(ctrl, EHCI_OP_PORTSC(i), ps);
+            ctrl->port_connected[i] = 0;
+            continue;
+        }
 
-    /* Flags */
-    u8   initialized;
-    u8   has_64bit;   /* HC suporta endereçamento 64-bit */
-    u8   eecp;        /* Extended Capability Pointer */
-} ehci_t;
+        /* Reset da porta para detectar velocidade */
+        ehci_port_reset(ctrl, i);
+
+        ps = ehci_read32(ctrl, EHCI_OP_PORTSC(i));
+
+        if (ps & EHCI_PORT_PE) {
+            /* Port Enable após reset = High Speed */
+            ctrl->port_connected[i] = 1;
+            ctrl->port_speed[i]     = 2; /* High Speed */
+            found++;
+        } else {
+            /* Full Speed — transfere para companion */
+            ctrl->port_speed[i] = 0;
+            ps |= EHCI_PORT_OWNER;
+            ehci_write32(ctrl, EHCI_OP_PORTSC(i), ps);
+            ctrl->port_connected[i] = 0;
+        }
+    }
+    return found;
+}
 
 /* ============================================================
- * API pública
+ * Montagem de QH + qTDs
  * ============================================================ */
 
-/**
- * Detecta controlador EHCI no barramento PCI.
- * Busca por Class Code 0x0C0320.
- */
-int ehci_detect(ehci_t *ctrl);
+/** Configura os buffer pointers do qTD a partir de um endereço físico */
+static void qtd_set_buffer(ehci_qtd_t *qtd, u64 phys, u32 length) {
+    qtd->buf[0]    = (u32)(phys & 0xFFFFF000) | (u32)(phys & 0xFFF);
+    qtd->buf_hi[0] = (u32)(phys >> 32);
+    /* Páginas adicionais (para transferências > 4KB) */
+    if (length > 0x1000) {
+        qtd->buf[1]    = (u32)((phys + 0x1000) & 0xFFFFF000);
+        qtd->buf_hi[1] = (u32)((phys + 0x1000) >> 32);
+    }
+    if (length > 0x2000) {
+        qtd->buf[2]    = (u32)((phys + 0x2000) & 0xFFFFF000);
+        qtd->buf_hi[2] = (u32)((phys + 0x2000) >> 32);
+    }
+    if (length > 0x3000) {
+        qtd->buf[3]    = (u32)((phys + 0x3000) & 0xFFFFF000);
+        qtd->buf_hi[3] = (u32)((phys + 0x3000) >> 32);
+    }
+    if (length > 0x4000) {
+        qtd->buf[4]    = (u32)((phys + 0x4000) & 0xFFFFF000);
+        qtd->buf_hi[4] = (u32)((phys + 0x4000) >> 32);
+    }
+}
 
-/**
- * Inicializa o controlador EHCI.
- * Toma posse do BIOS, reseta o HC, configura frame list e async list.
- */
-int ehci_init(ehci_t *ctrl, u8 bus, u8 slot, u8 func);
+/** Monta um QH com a lista de qTDs encabeçada por first_qtd_phys */
+static ehci_qh_t *build_qh(ehci_t *ctrl, const ehci_pipe_t *pipe,
+                             u32 first_qtd_phys, u64 *qh_phys_out)
+{
+    ehci_qh_t *qh = qh_alloc(ctrl, qh_phys_out);
+    if (!qh) return (void *)0;
 
-/**
- * Varre e inicializa portas do root hub.
- * Dispositivos Low/Full Speed são transferidos para companion (OHCI/UHCI).
- */
-int ehci_scan_ports(ehci_t *ctrl);
+    /* epchar */
+    u32 eps;
+    switch (pipe->speed) {
+        case 1:  eps = QH_EPS_LOW;  break;
+        case 2:  eps = QH_EPS_HIGH; break;
+        default: eps = QH_EPS_FULL; break;
+    }
 
-/**
- * Reseta uma porta (somente High Speed permanece no EHCI).
- */
-int ehci_port_reset(ehci_t *ctrl, u8 port);
+    qh->epchar = QH_DEVADDR(pipe->dev_addr) |
+                 QH_ENDPT(pipe->ep_num)      |
+                 eps                          |
+                 QH_DTC                       |  /* toggle controlado pelo qTD */
+                 QH_MAXPKT(pipe->max_packet)  |
+                 QH_RL(3);
 
-/**
- * Transferência Control (bloqueante).
- */
+    /* Para Full/Low Speed em Control: seta C bit e info do TT */
+    if (pipe->speed < 2 && pipe->type == EHCI_PIPE_CONTROL)
+        qh->epchar |= QH_C;
+
+    /* epcap */
+    qh->epcap = QH_MULT(1);
+    if (pipe->speed < 2) {
+        qh->epcap |= QH_HUBADDR(pipe->hub_addr) |
+                     QH_PORTNUM(pipe->hub_port);
+    }
+
+    /* Aponta para o primeiro qTD */
+    qh->qtd_next     = first_qtd_phys;
+    qh->qtd_alt_next = QTD_NEXT_TERMINATE;
+    qh->qtd_token    = 0;
+    qh->current_qtd  = 0;
+
+    return qh;
+}
+
+/** Insere QH na async list e aguarda conclusão */
+static i32 ehci_submit_async(ehci_t *ctrl, ehci_qh_t *qh, u64 qh_phys,
+                              ehci_qtd_t *last_qtd, u32 timeout_ms)
+{
+    /* Insere depois do head: head → qh → (antigo next do head) */
+    qh->next = ctrl->async_head->next;
+    ctrl->async_head->next = (u32)qh_phys | QH_TYPE_QH;
+
+    /* Garante que async schedule está rodando */
+    u32 usbcmd = ehci_read32(ctrl, EHCI_OP_USBCMD);
+    if (!(usbcmd & EHCI_CMD_ASE)) {
+        usbcmd |= EHCI_CMD_ASE;
+        ehci_write32(ctrl, EHCI_OP_USBCMD, usbcmd);
+        ehci_wait_reg(ctrl, EHCI_OP_USBSTS, EHCI_STS_ASS, EHCI_STS_ASS, 50);
+    }
+
+    /* Aguarda último qTD ficar inativo (ACTIVE=0) */
+    u32 elapsed = 0;
+    while (elapsed < timeout_ms) {
+        if (!(last_qtd->token & QTD_STATUS_ACTIVE)) break;
+        mdelay(1);
+        elapsed++;
+    }
+
+    /* Remove QH da async list */
+    ctrl->async_head->next = qh->next;
+
+    /* Async Advance Doorbell — garante que o HC não está mais usando o QH */
+    usbcmd = ehci_read32(ctrl, EHCI_OP_USBCMD);
+    usbcmd |= EHCI_CMD_IAAD;
+    ehci_write32(ctrl, EHCI_OP_USBCMD, usbcmd);
+    ehci_wait_reg(ctrl, EHCI_OP_USBSTS, EHCI_STS_IAA, EHCI_STS_IAA, 50);
+    ehci_write32(ctrl, EHCI_OP_USBSTS, EHCI_STS_IAA);
+
+    if (elapsed >= timeout_ms) return -2; /* timeout */
+
+    /* Verifica erro no token do último qTD */
+    u32 tok = last_qtd->token;
+    if (tok & (QTD_STATUS_HALTED | QTD_STATUS_BUFERR |
+               QTD_STATUS_BABBLE | QTD_STATUS_XACTERR))
+        return -3;
+
+    return 0;
+}
+
+/* ============================================================
+ * Transferência Control
+ * ============================================================ */
+
 i32 ehci_control_transfer(ehci_t *ctrl, ehci_pipe_t *pipe,
-                           const u8 setup[8], void *data, u32 length);
+                           const u8 setup[8], void *data, u32 length)
+{
+    if (!ctrl->initialized) return -1;
 
-/**
- * Transferência Bulk (bloqueante).
- * @param in  1 = IN (device→host), 0 = OUT (host→device)
- */
-i32 ehci_bulk_transfer(ehci_t *ctrl, ehci_pipe_t *pipe,
-                        void *data, u32 length, u8 in);
+    u64 setup_qtd_phys, data_qtd_phys, status_qtd_phys;
 
-/**
- * Lê descritor USB do dispositivo (GET_DESCRIPTOR via Control).
- */
-i32 ehci_get_descriptor(ehci_t *ctrl, u8 dev_addr, u8 speed,
-                         void *buf, u16 len);
+    /* ---- qTD SETUP ---- */
+    ehci_qtd_t *setup_qtd = qtd_alloc(ctrl, &setup_qtd_phys);
+    if (!setup_qtd) return -1;
 
-/**
- * Lê registrador operacional de 32 bits.
- */
-u32  ehci_read32(const ehci_t *ctrl, u32 reg);
+    u64 setup_phys = virt_to_phys(setup);
+    qtd_set_buffer(setup_qtd, setup_phys, 8);
+    setup_qtd->token = QTD_STATUS_ACTIVE |
+                       QTD_PID_SETUP     |
+                       QTD_CERR_3        |
+                       QTD_BYTES(8)      |
+                       QTD_TOGGLE_0;
 
-/**
- * Escreve registrador operacional de 32 bits.
- */
-void ehci_write32(ehci_t *ctrl, u32 reg, u32 val);
+    /* ---- qTD DATA (opcional) ---- */
+    ehci_qtd_t *data_qtd = (void *)0;
+    if (data && length > 0) {
+        data_qtd = qtd_alloc(ctrl, &data_qtd_phys);
+        if (!data_qtd) { qtd_free(ctrl, setup_qtd); return -1; }
 
-/**
- * Handler de interrupção — chame do seu IRQ handler.
- */
-void ehci_irq_handler(ehci_t *ctrl);
+        u64 data_phys = virt_to_phys(data);
+        qtd_set_buffer(data_qtd, data_phys, length);
+        u32 pid = (setup[0] & 0x80) ? QTD_PID_IN : QTD_PID_OUT;
+        data_qtd->token = QTD_STATUS_ACTIVE |
+                          pid               |
+                          QTD_CERR_3        |
+                          QTD_BYTES(length) |
+                          QTD_TOGGLE_1;     /* Data sempre começa em DATA1 */
+    }
 
-/**
- * Desliga o controlador EHCI.
- */
-void ehci_shutdown(ehci_t *ctrl);
+    /* ---- qTD STATUS ---- */
+    ehci_qtd_t *status_qtd = qtd_alloc(ctrl, &status_qtd_phys);
+    if (!status_qtd) {
+        if (data_qtd) qtd_free(ctrl, data_qtd);
+        qtd_free(ctrl, setup_qtd);
+        return -1;
+    }
+    u32 status_pid = (setup[0] & 0x80) ? QTD_PID_OUT : QTD_PID_IN;
+    status_qtd->token = QTD_STATUS_ACTIVE |
+                        status_pid         |
+                        QTD_CERR_3         |
+                        QTD_BYTES(0)       |
+                        QTD_TOGGLE_1       |
+                        QTD_IOC;           /* Interrupção ao completar */
+
+    /* ---- Encadeia qTDs ---- */
+    if (data_qtd) {
+        setup_qtd->next  = (u32)data_qtd_phys;
+        data_qtd->next   = (u32)status_qtd_phys;
+    } else {
+        setup_qtd->next  = (u32)status_qtd_phys;
+    }
+    status_qtd->next = QTD_NEXT_TERMINATE;
+
+    /* ---- Monta QH ---- */
+    u64 qh_phys;
+    ehci_qh_t *qh = build_qh(ctrl, pipe, (u32)setup_qtd_phys, &qh_phys);
+    if (!qh) {
+        qtd_free(ctrl, status_qtd);
+        if (data_qtd) qtd_free(ctrl, data_qtd);
+        qtd_free(ctrl, setup_qtd);
+        return -1;
+    }
+
+    /* ---- Submete e aguarda ---- */
+    i32 ret = ehci_submit_async(ctrl, qh, qh_phys, status_qtd, 500);
+
+    /* ---- Libera ---- */
+    qh_free(ctrl, qh);
+    qtd_free(ctrl, status_qtd);
+    if (data_qtd) qtd_free(ctrl, data_qtd);
+    qtd_free(ctrl, setup_qtd);
+
+    if (ret < 0) return ret;
+    return (i32)length;
+}
 
 /* ============================================================
- * Helpers USB — setup packets padrão
+ * Transferência Bulk
  * ============================================================ */
 
-static inline void usb_setup_get_descriptor(u8 *s, u8 type, u8 idx, u16 len) {
-    s[0]=0x80; s[1]=0x06; s[2]=idx; s[3]=type;
-    s[4]=(u8)(len&0xFF); s[5]=(u8)(len>>8); s[6]=0; s[7]=0;
-}
-static inline void usb_setup_set_address(u8 *s, u8 addr) {
-    s[0]=0x00; s[1]=0x05; s[2]=addr; s[3]=0;
-    s[4]=0; s[5]=0; s[6]=0; s[7]=0;
-}
-static inline void usb_setup_set_configuration(u8 *s, u8 cfg) {
-    s[0]=0x00; s[1]=0x09; s[2]=cfg; s[3]=0;
-    s[4]=0; s[5]=0; s[6]=0; s[7]=0;
+i32 ehci_bulk_transfer(ehci_t *ctrl, ehci_pipe_t *pipe,
+                        void *data, u32 length, u8 in)
+{
+    if (!ctrl->initialized || !data || length == 0) return -1;
+
+    u64 qtd_phys;
+    ehci_qtd_t *qtd = qtd_alloc(ctrl, &qtd_phys);
+    if (!qtd) return -1;
+
+    u64 data_phys = virt_to_phys(data);
+    qtd_set_buffer(qtd, data_phys, length);
+
+    u32 pid    = in ? QTD_PID_IN : QTD_PID_OUT;
+    u32 toggle = pipe->toggle ? QTD_TOGGLE_1 : QTD_TOGGLE_0;
+
+    qtd->token = QTD_STATUS_ACTIVE |
+                 pid               |
+                 QTD_CERR_3        |
+                 QTD_BYTES(length) |
+                 toggle            |
+                 QTD_IOC;
+    qtd->next  = QTD_NEXT_TERMINATE;
+
+    u64 qh_phys;
+    ehci_qh_t *qh = build_qh(ctrl, pipe, (u32)qtd_phys, &qh_phys);
+    if (!qh) { qtd_free(ctrl, qtd); return -1; }
+
+    i32 ret = ehci_submit_async(ctrl, qh, qh_phys, qtd, 500);
+
+    /* Atualiza toggle */
+    pipe->toggle ^= 1;
+
+    qh_free(ctrl, qh);
+    qtd_free(ctrl, qtd);
+
+    if (ret < 0) return ret;
+    return (i32)length;
 }
 
-#define USB_DESC_DEVICE         0x01
-#define USB_DESC_CONFIGURATION  0x02
-#define USB_DESC_STRING         0x03
-#define USB_DESC_INTERFACE      0x04
-#define USB_DESC_ENDPOINT       0x05
+/* ============================================================
+ * GET_DESCRIPTOR
+ * ============================================================ */
 
-#endif /* EHCI_H */
+i32 ehci_get_descriptor(ehci_t *ctrl, u8 dev_addr, u8 speed,
+                         void *buf, u16 len)
+{
+    ehci_pipe_t pipe;
+    ehci_memset(&pipe, 0, sizeof(pipe));
+    pipe.type       = EHCI_PIPE_CONTROL;
+    pipe.dev_addr   = dev_addr;
+    pipe.ep_num     = 0;
+    pipe.speed      = speed;
+    pipe.max_packet = (speed == 2) ? 64 : 8;
+
+    u8 setup[8];
+    usb_setup_get_descriptor(setup, USB_DESC_DEVICE, 0, len);
+    return ehci_control_transfer(ctrl, &pipe, setup, buf, len);
+}
+
+/* ============================================================
+ * IRQ Handler
+ * ============================================================ */
+
+void ehci_irq_handler(ehci_t *ctrl) {
+    if (!ctrl->initialized) return;
+
+    u32 sts = ehci_read32(ctrl, EHCI_OP_USBSTS);
+    u32 en  = ehci_read32(ctrl, EHCI_OP_USBINTR);
+    sts &= en;
+    if (!sts) return;
+
+    /* Limpa interrupções */
+    ehci_write32(ctrl, EHCI_OP_USBSTS, sts);
+
+    if (sts & EHCI_STS_INT) {
+        /* Transferência completada — wakeup de threads esperando */
+    }
+
+    if (sts & EHCI_STS_ERR) {
+        /* Erro de transferência */
+    }
+
+    if (sts & EHCI_STS_PCD) {
+        /* Port Change Detect — alguma porta mudou */
+        u8 i;
+        for (i = 0; i < ctrl->num_ports; i++) {
+            u32 ps = ehci_read32(ctrl, EHCI_OP_PORTSC(i));
+            if (ps & EHCI_PORT_CSC) {
+                ctrl->port_connected[i] = (ps & EHCI_PORT_CCS) ? 1 : 0;
+                /* Limpa CSC */
+                ehci_write32(ctrl, EHCI_OP_PORTSC(i),
+                             (ps & ~EHCI_PORT_CHANGE_BITS) | EHCI_PORT_CSC);
+            }
+        }
+    }
+
+    if (sts & EHCI_STS_HSE) {
+        /* Host System Error — reseta o HC */
+        ehci_write32(ctrl, EHCI_OP_USBCMD, EHCI_CMD_HCRESET);
+    }
+
+    if (sts & EHCI_STS_IAA) {
+        /* Async Advance — QH foi removido com segurança */
+    }
+}
+
+/* ============================================================
+ * Shutdown
+ * ============================================================ */
+
+void ehci_shutdown(ehci_t *ctrl) {
+    if (!ctrl->initialized) return;
+
+    /* Desabilita interrupções */
+    ehci_write32(ctrl, EHCI_OP_USBINTR, 0);
+
+    /* Para o HC */
+    u32 usbcmd = ehci_read32(ctrl, EHCI_OP_USBCMD);
+    usbcmd &= ~EHCI_CMD_RUN;
+    ehci_write32(ctrl, EHCI_OP_USBCMD, usbcmd);
+    ehci_wait_reg(ctrl, EHCI_OP_USBSTS, EHCI_STS_HALTED, EHCI_STS_HALTED, 100);
+
+    /* Devolve portas para companions */
+    u8 i;
+    for (i = 0; i < ctrl->num_ports; i++) {
+        u32 ps = ehci_read32(ctrl, EHCI_OP_PORTSC(i));
+        ehci_write32(ctrl, EHCI_OP_PORTSC(i), ps | EHCI_PORT_OWNER);
+    }
+
+    /* Limpa configure flag */
+    ehci_write32(ctrl, EHCI_OP_CONFIGFLAG, 0);
+
+    ctrl->initialized = 0;
+}
